@@ -13,10 +13,12 @@ from scipy.signal import butter, lfilter, medfilt
 st.set_page_config(page_title="Beat Blueprint Studio", page_icon="🎛️", layout="wide")
 SAVE_DIR = Path("saved_takes")
 STEM_DIR = Path("saved_stems")
+SUNO_DIR = Path("suno_beats")
 BEAT_DIR = Path("generated_beats")
 
 SAVE_DIR.mkdir(exist_ok=True)
 STEM_DIR.mkdir(exist_ok=True)
+SUNO_DIR.mkdir(exist_ok=True)
 BEAT_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 44100
 
@@ -63,6 +65,52 @@ def add_dark_reverb(audio: np.ndarray, fs: int, wet: float = 0.30) -> np.ndarray
     b, a = butter(2, 2200 / (fs / 2), btype="low")
     reverb = lfilter(b, a, reverb)
     return (1.0 - wet) * audio + wet * reverb
+
+
+def polish_vocals(y: np.ndarray, fs: int) -> np.ndarray:
+    """
+    Studio vocal chain for raw mic takes:
+    1. Cuts low-end mic rumble (< 85 Hz)
+    2. Gentle compression to balance quiet verses and loud punchlines
+    3. Subtle room glue so vocals sit naturally inside a mastered beat
+    """
+    if len(y) == 0:
+        return y
+
+    b, a = butter(2, 85.0 / (fs / 2.0), btype="high")
+    y_clean = lfilter(b, a, y)
+
+    peak = float(np.max(np.abs(y_clean)))
+    if peak < 1e-6:
+        return y_clean
+    y_norm = y_clean / peak
+
+    abs_y = np.abs(y_norm)
+    coeff = np.exp(-1.0 / (0.035 * fs))
+    env = lfilter([1.0 - coeff], [1.0, -coeff], abs_y)
+
+    threshold = 0.22
+    ratio = 3.0
+    gain = np.ones_like(env)
+    above = env > threshold
+    compressed_env = threshold + (env[above] - threshold) / ratio
+    gain[above] = compressed_env / (env[above] + 1e-6)
+
+    y_comp = np.tanh((y_norm * gain) * 1.8) * 0.85
+    return add_dark_reverb(y_comp, fs, wet=0.14)
+
+
+def apply_offset(y: np.ndarray, offset_sec: float, fs: int) -> np.ndarray:
+    """Shifts track forward (+ seconds delay) or trims start (- seconds)."""
+    shift_samples = int(round(offset_sec * fs))
+    if shift_samples > 0:
+        return np.concatenate([np.zeros(shift_samples, dtype=np.float32), y])
+    elif shift_samples < 0:
+        trim = abs(shift_samples)
+        if trim >= len(y):
+            return np.zeros(1, dtype=np.float32)
+        return y[trim:]
+    return y
 
 
 # --- STEP 1 & 2: EXACT TONE & DYNAMICS EXTRACTOR ---
@@ -211,7 +259,7 @@ def digitize_to_synth(
 
 # --- UI LAYOUT ---
 st.title("🎛️ Vocal Tone Digitizer")
-st.caption("Record voice → Digitize into exact synth stems → Mix them together.")
+st.caption("Record voice → Digitize into exact synth stems → Mix with Suno beats & raw vocals.")
 
 tab_record, tab_synth, tab_mixer = st.tabs(
     ["🎙️ Step 1: Record Tones", "🎹 Step 2: Save as Synth Stem", "🎚️ Step 3: Multi-Track Mixer"]
@@ -255,14 +303,16 @@ with tab_record:
 
                 st.divider()
                 st.subheader("2. Save Raw Recording")
-                
-                # CLEAN UX: Empty by default, clear placeholder
-                take_name = st.text_input("Name your take (optional):", placeholder="e.g., funky_bassline")
+
+                take_name = st.text_input(
+                    "Name your take (optional):", placeholder="e.g., funky_bassline or verse_vocals"
+                )
 
                 if st.button("💾 Save Take", type="primary", use_container_width=True):
-                    # If user typed something, clean it. If empty, generate a short timestamp.
                     if take_name.strip():
-                        clean_name = "".join(c for c in take_name if c.isalnum() or c in ("-", "_")).strip()
+                        clean_name = "".join(
+                            c for c in take_name if c.isalnum() or c in ("-", "_")
+                        ).strip()
                     else:
                         clean_name = f"take_{datetime.now().strftime('%H%M%S')}"
 
@@ -304,7 +354,9 @@ with tab_record:
 # ==========================================
 with tab_synth:
     st.subheader("🎹 Digitize Recording Into a Synth Stem")
-    st.caption("Pick a raw take, turn it into a synthesized instrument, and save it as a Stem for the Mixer.")
+    st.caption(
+        "Pick a raw take, turn it into a synthesized instrument, and save it as a Stem for the Mixer."
+    )
 
     available_takes = sorted([p.stem for p in SAVE_DIR.glob("*.wav")])
 
@@ -371,18 +423,20 @@ with tab_synth:
             st.audio(st.session_state["digitized_wav"], format="audio/wav", loop=True)
 
             save_c1, save_c2 = st.columns([3, 1])
-            
-            # CLEAN UX: Empty by default, clear placeholder
-            out_name = save_c1.text_input("Name your Stem (optional):", placeholder="e.g., moog_bounce")
-            
+
+            out_name = save_c1.text_input(
+                "Name your Stem (optional):", placeholder="e.g., moog_bounce"
+            )
+
             if save_c2.button("💾 Save as Stem", use_container_width=True):
-                # If user typed something, clean it. If empty, generate a smart short name based on the synth.
                 if out_name.strip():
-                    clean_out = "".join(c for c in out_name if c.isalnum() or c in ("-", "_")).strip()
+                    clean_out = "".join(
+                        c for c in out_name if c.isalnum() or c in ("-", "_")
+                    ).strip()
                 else:
-                    short_preset = synth_preset.split()[1].lower() # e.g. 'dark', 'moog', 'cinematic', 'digitized'
+                    short_preset = synth_preset.split()[1].lower()
                     clean_out = f"{short_preset}_{datetime.now().strftime('%H%M%S')}"
-                    
+
                 out_path = STEM_DIR / f"{clean_out}.wav"
                 out_path.write_bytes(st.session_state["digitized_wav"])
                 st.toast(f"Saved stem '{clean_out}.wav' to Mixer!", icon="🔥")
@@ -405,72 +459,194 @@ with tab_synth:
 
 
 # ==========================================
-# TAB 3: MULTI-TRACK MIXER
+# TAB 3: HYBRID MULTI-TRACK MIXER
 # ==========================================
 with tab_mixer:
-    st.subheader("🎚️ Multi-Track Studio Mixer")
-    st.caption("Combine your digitized stems. Differing track lengths are handled automatically—shorter tracks will just naturally stop playing while the rest continue.")
+    st.subheader("🎚️ Hybrid Studio Mixer (Suno Beats + Synth Stems + Raw Vocals)")
+    st.caption(
+        "1) Mix a Synth Stem + Raw Vocal to export a Guide Track for Suno.  "
+        "2) Import Suno's instrumental below and align your polished raw vocals over it."
+    )
 
-    available_stems = sorted([p.stem for p in STEM_DIR.glob("*.wav")])
-    if not available_stems:
-        st.info("No saved stems yet. Digitize and save some instruments in Tab 2 first!")
+    # --- UPLOAD SUNO BEAT ---
+    with st.container(border=True):
+        up_col1, up_col2 = st.columns([2, 1])
+        with up_col1:
+            uploaded_suno = st.file_uploader(
+                "📥 Import Suno Beat (.mp3 or .wav)",
+                type=["mp3", "wav"],
+                help="Upload the instrumental track Suno generated around your guide.",
+            )
+            if uploaded_suno is not None:
+                dest_path = SUNO_DIR / uploaded_suno.name
+                if not dest_path.exists() or dest_path.stat().st_size != uploaded_suno.size:
+                    dest_path.write_bytes(uploaded_suno.getvalue())
+                    st.toast(f"Imported '{uploaded_suno.name}' into Mixer!", icon="📥")
+
+        with up_col2:
+            suno_files = sorted(
+                [p for p in SUNO_DIR.iterdir() if p.suffix.lower() in (".mp3", ".wav")],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            st.markdown(f"**Imported Suno Beats ({len(suno_files)})**")
+            if suno_files:
+                del_target = st.selectbox(
+                    "Manage imports",
+                    ["(Select to delete)"] + [p.name for p in suno_files],
+                    label_visibility="collapsed",
+                )
+                if del_target != "(Select to delete)":
+                    if st.button("🗑️ Delete Selected Import", use_container_width=True):
+                        (SUNO_DIR / del_target).unlink(missing_ok=True)
+                        st.rerun()
+            else:
+                st.caption("No Suno beats imported yet.")
+
+    # Build unified source list across Suno Beats, Synth Stems, and Raw Vocals
+    suno_options = [f"[Suno] {p.name}" for p in suno_files]
+    stem_options = [f"[Stem] {p.stem}" for p in sorted(STEM_DIR.glob("*.wav"))]
+    vocal_options = [f"[Vocal] {p.stem}" for p in sorted(SAVE_DIR.glob("*.wav"))]
+
+    mixer_options = ["(None)"] + suno_options + stem_options + vocal_options
+
+    if len(mixer_options) == 1:
+        st.info("Record a take in Tab 1 or import a Suno beat above to start mixing!")
     else:
-        mixer_options = ["(None)"] + available_stems
-        track_selections = []
-        track_volumes = []
+        st.divider()
+        track_configs = []
 
         cols = st.columns(4)
         for i in range(4):
             with cols[i]:
-                st.markdown(f"**Track {i+1}**")
-                choice = st.selectbox(f"Stem {i+1}", mixer_options, index=0, label_visibility="collapsed")
-                vol = st.slider(f"Volume {i+1}", 0.0, 1.5, 1.0, 0.05, label_visibility="collapsed")
-                
-                if choice != "(None)":
-                    st.audio(str(STEM_DIR / f"{choice}.wav"), format="audio/wav")
-                
-                track_selections.append(choice)
-                track_volumes.append(vol)
+                with st.container(border=True):
+                    st.markdown(f"**Track {i+1}**")
+                    choice = st.selectbox(
+                        f"Source {i+1}",
+                        mixer_options,
+                        index=0,
+                        key=f"mix_src_{i}",
+                        label_visibility="collapsed",
+                    )
 
-        if st.button("🎛️ Mix Full Beat", type="primary", use_container_width=True):
-            loaded_audio = []
-            for choice, vol in zip(track_selections, track_volumes):
-                if choice != "(None)":
-                    y, _ = librosa.load(str(STEM_DIR / f"{choice}.wav"), sr=SAMPLE_RATE, mono=True)
-                    loaded_audio.append(y * vol)
+                    vol = st.slider(
+                        "Volume",
+                        min_value=0.0,
+                        max_value=1.5,
+                        value=1.0,
+                        step=0.05,
+                        key=f"mix_vol_{i}",
+                    )
 
-            if not loaded_audio:
+                    nudge_sec = st.number_input(
+                        "Timing Nudge (sec)",
+                        min_value=-15.0,
+                        max_value=30.0,
+                        value=0.0,
+                        step=0.05,
+                        format="%.2f",
+                        key=f"mix_nudge_{i}",
+                        help="+ delays start (e.g. wait for Suno intro); - trims dead air at start",
+                    )
+
+                    is_vocal = choice.startswith("[Vocal]")
+                    polish = st.checkbox(
+                        "✨ Vocal Polish",
+                        value=is_vocal,
+                        key=f"mix_pol_{i}_{choice}",
+                        help="Cuts low rumble, evens out volume, and adds subtle room reverb",
+                    )
+
+                    if choice != "(None)":
+                        if choice.startswith("[Suno] "):
+                            preview_path = SUNO_DIR / choice.removeprefix("[Suno] ")
+                        elif choice.startswith("[Stem] "):
+                            preview_path = STEM_DIR / f"{choice.removeprefix('[Stem] ')}.wav"
+                        else:
+                            preview_path = SAVE_DIR / f"{choice.removeprefix('[Vocal] ')}.wav"
+
+                        if preview_path.exists():
+                            st.audio(str(preview_path))
+
+                    track_configs.append(
+                        {
+                            "choice": choice,
+                            "vol": vol,
+                            "nudge": nudge_sec,
+                            "polish": polish,
+                        }
+                    )
+
+        if st.button("🎛️ Mix Full Track", type="primary", use_container_width=True):
+            loaded_tracks = []
+            for cfg in track_configs:
+                choice = cfg["choice"]
+                if choice == "(None)":
+                    continue
+
+                if choice.startswith("[Suno] "):
+                    file_path = SUNO_DIR / choice.removeprefix("[Suno] ")
+                elif choice.startswith("[Stem] "):
+                    file_path = STEM_DIR / f"{choice.removeprefix('[Stem] ')}.wav"
+                else:
+                    file_path = SAVE_DIR / f"{choice.removeprefix('[Vocal] ')}.wav"
+
+                if file_path.exists():
+                    y, _ = librosa.load(str(file_path), sr=SAMPLE_RATE, mono=True)
+                    if cfg["polish"]:
+                        y = polish_vocals(y, SAMPLE_RATE)
+                    y = apply_offset(y, cfg["nudge"], SAMPLE_RATE)
+                    loaded_tracks.append(y * cfg["vol"])
+
+            if not loaded_tracks:
                 st.warning("Select at least one track to mix!")
             else:
-                with st.spinner("Summing tracks..."):
-                    # Find the longest track to accommodate varying lengths automatically
-                    max_len = max(len(arr) for arr in loaded_audio)
+                with st.spinner("Applying vocal polish, aligning timing, and summing tracks..."):
+                    max_len = max(len(arr) for arr in loaded_tracks)
                     master_mix = np.zeros(max_len, dtype=np.float32)
 
-                    # Add each track into the master array (zero-pads shorter tracks automatically)
-                    for arr in loaded_audio:
-                        master_mix[:len(arr)] += arr
+                    for arr in loaded_tracks:
+                        master_mix[: len(arr)] += arr
 
                     st.session_state["master_mix"] = to_wav_bytes(master_mix, SAMPLE_RATE)
 
         if "master_mix" in st.session_state:
             st.divider()
-            st.markdown("### 🎧 Final Mixed Master")
+            st.markdown("### 🎧 Mixed Output")
             st.audio(st.session_state["master_mix"], format="audio/wav", loop=True)
 
             save_m1, save_m2 = st.columns([3, 1])
-            
-            # CLEAN UX: Empty by default, clear placeholder
-            master_name = save_m1.text_input("Name your final beat (optional):", placeholder="e.g., oakland_funk_master")
-            
-            if save_m2.button("💾 Save Final Beat WAV", use_container_width=True):
-                # If user typed something, clean it. If empty, generate a short master name.
+
+            master_name = save_m1.text_input(
+                "Name your export (optional):",
+                placeholder="e.g., suno_guide_mix or final_song",
+            )
+
+            if save_m2.button("💾 Save Export WAV", use_container_width=True):
                 if master_name.strip():
-                    clean_master = "".join(c for c in master_name if c.isalnum() or c in ("-", "_")).strip()
+                    clean_master = "".join(
+                        c for c in master_name if c.isalnum() or c in ("-", "_")
+                    ).strip()
                 else:
-                    clean_master = f"master_{datetime.now().strftime('%H%M%S')}"
-                    
+                    clean_master = f"mix_{datetime.now().strftime('%H%M%S')}"
+
                 out_path = BEAT_DIR / f"{clean_master}.wav"
                 out_path.write_bytes(st.session_state["master_mix"])
                 st.toast(f"Saved '{clean_master}.wav' to generated_beats/!", icon="🔥")
                 st.rerun()
+
+    # Show previously exported mixes
+    st.divider()
+    st.subheader("💿 Saved Mixes & Final Songs")
+    saved_beats = sorted(BEAT_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not saved_beats:
+        st.caption("Your exported guide tracks and finished songs will appear here.")
+    else:
+        for b_file in saved_beats:
+            with st.container(border=True):
+                b1, b2 = st.columns([5, 1])
+                b1.markdown(f"**{b_file.stem}**")
+                if b2.button("🗑️", key=f"del_beat_{b_file.stem}"):
+                    b_file.unlink(missing_ok=True)
+                    st.rerun()
+                st.audio(str(b_file), format="audio/wav")
