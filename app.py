@@ -12,8 +12,11 @@ from scipy.signal import butter, lfilter, medfilt
 # --- SETUP ---
 st.set_page_config(page_title="Beat Blueprint Studio", page_icon="🎛️", layout="wide")
 SAVE_DIR = Path("saved_takes")
+STEM_DIR = Path("saved_stems")
 BEAT_DIR = Path("generated_beats")
+
 SAVE_DIR.mkdir(exist_ok=True)
+STEM_DIR.mkdir(exist_ok=True)
 BEAT_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 44100
 
@@ -90,7 +93,6 @@ def extract_exact_tones(y: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray,
     else:
         f0_clean.fill(110.0)
 
-    # Remove single-frame tracker blips without flattening vocal slides
     f0_clean = medfilt(f0_clean, kernel_size=5)
     return f0_clean, amp_frames, hop
 
@@ -143,26 +145,21 @@ def digitize_to_synth(
     if len(f0_frames) == 0:
         return np.zeros(n_samples, dtype=np.float32)
 
-    # Apply octave shift multiplier (0 = exact 1:1 pitch)
     pitch_mult = 2.0 ** octave_shift
     target_f0 = f0_frames * pitch_mult
 
-    # Apply noise gate so room hiss/breathing doesn't trigger the synth when silent
     gated_amp = np.where(amp_frames >= noise_gate, amp_frames, 0.0)
     if np.max(gated_amp) > 0:
         gated_amp = gated_amp / np.max(gated_amp)
 
-    # Interpolate pitch and volume smoothly to audio sample rate
     frame_idx = np.arange(len(target_f0)) * hop
     sample_idx = np.arange(n_samples)
     freq_audio = np.interp(sample_idx, frame_idx, target_f0)
     amp_audio = np.interp(sample_idx, frame_idx, gated_amp)
 
-    # Fast 8ms VCA envelope smoothing prevents clicks while preserving exact vocal dynamics
     vca_coeff = np.exp(-1.0 / (0.008 * SAMPLE_RATE))
     amp_smooth = lfilter([1.0 - vca_coeff], [1.0, -vca_coeff], amp_audio)
 
-    # Continuous phase integration (tracks every slide and vibrato seamlessly)
     phase = 2.0 * np.pi * np.cumsum(freq_audio) / SAMPLE_RATE
 
     if synth_preset == "Pure Digitized Tone":
@@ -176,7 +173,6 @@ def digitize_to_synth(
             + 0.45 * np.sin(phase_sub)
             + 0.25 * np.sin(2.0 * phase)
         )
-        # Warm analog saturation driven by how hard you push your voice
         osc = np.tanh(raw_bass * (1.5 + 1.8 * amp_smooth))
         cutoff_hz = 480.0
 
@@ -206,8 +202,6 @@ def digitize_to_synth(
         cutoff_hz = 1850.0
 
     synth_raw = osc * amp_smooth
-
-    # Smooth analog low-pass filter
     nyq = SAMPLE_RATE / 2.0
     b, a = butter(2, min(cutoff_hz / nyq, 0.95), btype="low")
     synth_filtered = lfilter(b, a, synth_raw)
@@ -217,10 +211,10 @@ def digitize_to_synth(
 
 # --- UI LAYOUT ---
 st.title("🎛️ Vocal Tone Digitizer")
-st.caption("Record your voice → Digitize the exact tones & dynamics 1:1 → Play them through one synthesizer.")
+st.caption("Record voice → Digitize into exact synth stems → Mix them together.")
 
-tab_record, tab_synth = st.tabs(
-    ["🎙️ Step 1: Record Tones", "🎹 Step 2: Digitize Into Synthesizer"]
+tab_record, tab_synth, tab_mixer = st.tabs(
+    ["🎙️ Step 1: Record Tones", "🎹 Step 2: Save as Synth Stem", "🎚️ Step 3: Multi-Track Mixer"]
 )
 
 # ==========================================
@@ -260,27 +254,28 @@ with tab_record:
                     st.area_chart(analysis["energy_timeline"], height=150)
 
                 st.divider()
-                st.subheader("2. Save Recording")
-                default_name = f"take_{datetime.now().strftime('%H%M%S')}"
-                take_name = st.text_input("Take Name", value=default_name)
+                st.subheader("2. Save Raw Recording")
+                
+                # CLEAN UX: Empty by default, clear placeholder
+                take_name = st.text_input("Name your take (optional):", placeholder="e.g., funky_bassline")
 
                 if st.button("💾 Save Take", type="primary", use_container_width=True):
-                    clean_name = "".join(
-                        c for c in take_name if c.isalnum() or c in ("-", "_")
-                    ).strip()
-                    if not clean_name:
-                        clean_name = default_name
+                    # If user typed something, clean it. If empty, generate a short timestamp.
+                    if take_name.strip():
+                        clean_name = "".join(c for c in take_name if c.isalnum() or c in ("-", "_")).strip()
+                    else:
+                        clean_name = f"take_{datetime.now().strftime('%H%M%S')}"
 
                     wav_path = SAVE_DIR / f"{clean_name}.wav"
                     json_path = SAVE_DIR / f"{clean_name}.json"
 
                     wav_path.write_bytes(audio_bytes)
                     json_path.write_text(json.dumps(analysis, indent=2))
-                    st.toast(f"Saved '{clean_name}'!", icon="✅")
+                    st.toast(f"Saved raw take '{clean_name}'!", icon="✅")
                     st.rerun()
 
     with right_col:
-        st.subheader("📂 Saved Recordings")
+        st.subheader("📂 Saved Raw Takes")
         saved_wavs = sorted(SAVE_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
 
         if not saved_wavs:
@@ -291,7 +286,7 @@ with tab_record:
                 with st.container(border=True):
                     top_row, del_row = st.columns([4, 1])
                     top_row.markdown(f"**{wav_file.stem}**")
-                    if del_row.button("🗑️", key=f"del_{wav_file.stem}", help="Delete take"):
+                    if del_row.button("🗑️", key=f"del_raw_{wav_file.stem}"):
                         wav_file.unlink(missing_ok=True)
                         json_file.unlink(missing_ok=True)
                         st.rerun()
@@ -308,18 +303,16 @@ with tab_record:
 # TAB 2: DIGITIZE INTO ONE SYNTHESIZER
 # ==========================================
 with tab_synth:
-    st.subheader("🎹 Digitize Recording Into One Synthesizer")
-    st.caption(
-        "Translates your exact pitch contour and vocal dynamics 1:1 into a single synthesizer. Your raw voice is completely removed."
-    )
+    st.subheader("🎹 Digitize Recording Into a Synth Stem")
+    st.caption("Pick a raw take, turn it into a synthesized instrument, and save it as a Stem for the Mixer.")
 
     available_takes = sorted([p.stem for p in SAVE_DIR.glob("*.wav")])
 
     if not available_takes:
-        st.info("Record and save a take in Tab 1 first, then come back here!")
+        st.info("Record and save a take in Tab 1 first!")
     else:
         options = ["(None)"] + available_takes
-        selected_take = st.selectbox("🎙️ Select Recording to Digitize", options, index=0)
+        selected_take = st.selectbox("🎙️ Select Raw Recording", options, index=0)
 
         if selected_take != "(None)":
             wav_file = SAVE_DIR / f"{selected_take}.wav"
@@ -357,23 +350,11 @@ with tab_synth:
 
             col3, col4 = st.columns(2)
             with col3:
-                noise_gate = st.slider(
-                    "🔇 Silence Gate (Cuts out room noise & breaths)",
-                    min_value=0.02,
-                    max_value=0.40,
-                    value=0.12,
-                    step=0.02,
-                )
+                noise_gate = st.slider("🔇 Silence Gate", 0.02, 0.40, 0.12, 0.02)
             with col4:
-                reverb_wet = st.slider(
-                    "🌌 Dark Hall Space",
-                    min_value=0.0,
-                    max_value=0.75,
-                    value=0.28,
-                    step=0.05,
-                )
+                reverb_wet = st.slider("🌌 Dark Hall Space", 0.0, 0.75, 0.28, 0.05)
 
-            if st.button("⚡ Digitize Tones Now", type="primary", use_container_width=True):
+            if st.button("⚡ Preview Synth", type="primary", use_container_width=True):
                 with st.spinner("Digitizing exact tones into synthesizer..."):
                     synth_audio = digitize_to_synth(
                         wav_file,
@@ -386,34 +367,110 @@ with tab_synth:
 
         if "digitized_wav" in st.session_state:
             st.divider()
-            st.markdown("### 🎧 Digitized Synthesizer Output")
+            st.markdown("### 🎧 Synth Preview")
             st.audio(st.session_state["digitized_wav"], format="audio/wav", loop=True)
 
             save_c1, save_c2 = st.columns([3, 1])
-            default_out = f"synth_{datetime.now().strftime('%H%M%S')}"
-            out_name = save_c1.text_input("Export File Name", value=default_out)
-            if save_c2.button("💾 Save Synth WAV", use_container_width=True):
-                clean_out = "".join(
-                    c for c in out_name if c.isalnum() or c in ("-", "_")
-                ).strip()
-                if not clean_out:
-                    clean_out = default_out
-                out_path = BEAT_DIR / f"{clean_out}.wav"
+            
+            # CLEAN UX: Empty by default, clear placeholder
+            out_name = save_c1.text_input("Name your Stem (optional):", placeholder="e.g., moog_bounce")
+            
+            if save_c2.button("💾 Save as Stem", use_container_width=True):
+                # If user typed something, clean it. If empty, generate a smart short name based on the synth.
+                if out_name.strip():
+                    clean_out = "".join(c for c in out_name if c.isalnum() or c in ("-", "_")).strip()
+                else:
+                    short_preset = synth_preset.split()[1].lower() # e.g. 'dark', 'moog', 'cinematic', 'digitized'
+                    clean_out = f"{short_preset}_{datetime.now().strftime('%H%M%S')}"
+                    
+                out_path = STEM_DIR / f"{clean_out}.wav"
                 out_path.write_bytes(st.session_state["digitized_wav"])
-                st.toast(f"Saved '{clean_out}.wav' to generated_beats/!", icon="🔥")
+                st.toast(f"Saved stem '{clean_out}.wav' to Mixer!", icon="🔥")
                 st.rerun()
 
     st.divider()
-    st.subheader("💿 Saved Synth Exports")
-    saved_beats = sorted(BEAT_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not saved_beats:
-        st.caption("Your exported synth tracks will appear here once you hit **Save Synth WAV**.")
+    st.subheader("💿 Saved Synth Stems")
+    saved_stems = sorted(STEM_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not saved_stems:
+        st.caption("Your exported synth stems will appear here.")
     else:
-        for b_file in saved_beats:
+        for s_file in saved_stems:
             with st.container(border=True):
                 b1, b2 = st.columns([5, 1])
-                b1.markdown(f"**{b_file.stem}**")
-                if b2.button("🗑️", key=f"del_beat_{b_file.stem}"):
-                    b_file.unlink(missing_ok=True)
+                b1.markdown(f"**{s_file.stem}**")
+                if b2.button("🗑️", key=f"del_stem_{s_file.stem}"):
+                    s_file.unlink(missing_ok=True)
                     st.rerun()
-                st.audio(str(b_file), format="audio/wav")
+                st.audio(str(s_file), format="audio/wav")
+
+
+# ==========================================
+# TAB 3: MULTI-TRACK MIXER
+# ==========================================
+with tab_mixer:
+    st.subheader("🎚️ Multi-Track Studio Mixer")
+    st.caption("Combine your digitized stems. Differing track lengths are handled automatically—shorter tracks will just naturally stop playing while the rest continue.")
+
+    available_stems = sorted([p.stem for p in STEM_DIR.glob("*.wav")])
+    if not available_stems:
+        st.info("No saved stems yet. Digitize and save some instruments in Tab 2 first!")
+    else:
+        mixer_options = ["(None)"] + available_stems
+        track_selections = []
+        track_volumes = []
+
+        cols = st.columns(4)
+        for i in range(4):
+            with cols[i]:
+                st.markdown(f"**Track {i+1}**")
+                choice = st.selectbox(f"Stem {i+1}", mixer_options, index=0, label_visibility="collapsed")
+                vol = st.slider(f"Volume {i+1}", 0.0, 1.5, 1.0, 0.05, label_visibility="collapsed")
+                
+                if choice != "(None)":
+                    st.audio(str(STEM_DIR / f"{choice}.wav"), format="audio/wav")
+                
+                track_selections.append(choice)
+                track_volumes.append(vol)
+
+        if st.button("🎛️ Mix Full Beat", type="primary", use_container_width=True):
+            loaded_audio = []
+            for choice, vol in zip(track_selections, track_volumes):
+                if choice != "(None)":
+                    y, _ = librosa.load(str(STEM_DIR / f"{choice}.wav"), sr=SAMPLE_RATE, mono=True)
+                    loaded_audio.append(y * vol)
+
+            if not loaded_audio:
+                st.warning("Select at least one track to mix!")
+            else:
+                with st.spinner("Summing tracks..."):
+                    # Find the longest track to accommodate varying lengths automatically
+                    max_len = max(len(arr) for arr in loaded_audio)
+                    master_mix = np.zeros(max_len, dtype=np.float32)
+
+                    # Add each track into the master array (zero-pads shorter tracks automatically)
+                    for arr in loaded_audio:
+                        master_mix[:len(arr)] += arr
+
+                    st.session_state["master_mix"] = to_wav_bytes(master_mix, SAMPLE_RATE)
+
+        if "master_mix" in st.session_state:
+            st.divider()
+            st.markdown("### 🎧 Final Mixed Master")
+            st.audio(st.session_state["master_mix"], format="audio/wav", loop=True)
+
+            save_m1, save_m2 = st.columns([3, 1])
+            
+            # CLEAN UX: Empty by default, clear placeholder
+            master_name = save_m1.text_input("Name your final beat (optional):", placeholder="e.g., oakland_funk_master")
+            
+            if save_m2.button("💾 Save Final Beat WAV", use_container_width=True):
+                # If user typed something, clean it. If empty, generate a short master name.
+                if master_name.strip():
+                    clean_master = "".join(c for c in master_name if c.isalnum() or c in ("-", "_")).strip()
+                else:
+                    clean_master = f"master_{datetime.now().strftime('%H%M%S')}"
+                    
+                out_path = BEAT_DIR / f"{clean_master}.wav"
+                out_path.write_bytes(st.session_state["master_mix"])
+                st.toast(f"Saved '{clean_master}.wav' to generated_beats/!", icon="🔥")
+                st.rerun()
