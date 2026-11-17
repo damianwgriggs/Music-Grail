@@ -1,5 +1,10 @@
 import io
 import json
+import re
+import shutil
+import subprocess
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -15,11 +20,15 @@ SAVE_DIR = Path("saved_takes")
 STEM_DIR = Path("saved_stems")
 SUNO_DIR = Path("suno_beats")
 BEAT_DIR = Path("generated_beats")
+VIDEO_CLIPS_DIR = Path("uploaded_clips")
+VIDEO_OUT_DIR = Path("generated_videos")
 
 SAVE_DIR.mkdir(exist_ok=True)
 STEM_DIR.mkdir(exist_ok=True)
 SUNO_DIR.mkdir(exist_ok=True)
 BEAT_DIR.mkdir(exist_ok=True)
+VIDEO_CLIPS_DIR.mkdir(exist_ok=True)
+VIDEO_OUT_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 44100
 
 
@@ -257,12 +266,187 @@ def digitize_to_synth(
     return add_dark_reverb(synth_filtered, SAMPLE_RATE, wet=reverb_wet)
 
 
+# --- STEP 4: VIDEO & AUDIO MERGE HELPERS ---
+def get_ffmpeg_bin() -> str | None:
+    """Finds ffmpeg on system PATH or via imageio-ffmpeg if installed."""
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def probe_media_info(ffmpeg_bin: str, media_path: Path) -> dict:
+    """Extracts duration (sec) and video dimensions (width, height) via ffmpeg."""
+    cmd = [ffmpeg_bin, "-i", str(media_path)]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stderr = proc.stderr
+
+    dur_sec = 0.0
+    dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+    if dur_match:
+        dur_sec = (
+            int(dur_match.group(1)) * 3600
+            + int(dur_match.group(2)) * 60
+            + float(dur_match.group(3))
+        )
+
+    width, height = 1280, 720
+    res_match = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", stderr)
+    if res_match:
+        w = int(res_match.group(1))
+        h = int(res_match.group(2))
+        width = w - (w % 2)
+        height = h - (h % 2)
+
+    return {"duration": round(dur_sec, 2), "width": width, "height": height}
+
+
+def build_music_video(
+    ffmpeg_bin: str,
+    sequence: list[dict],
+    audio_path: Path,
+    out_path: Path,
+    match_audio_length: bool = True,
+) -> tuple[bool, str]:
+    """
+    1. Strips ALL original sound (-an) from every AI video clip.
+    2. Normalizes resolution, framerate, and pixel format across clips.
+    3. Concatenates clips in Flow sequence order (respecting each clip's loop count).
+    4. Merges the silent video sequence with the selected music track.
+    """
+    if not sequence:
+        return False, "No video clips in the sequence."
+
+    first_clip_path = VIDEO_CLIPS_DIR / sequence[0]["filename"]
+    if not first_clip_path.exists():
+        return False, f"Missing clip file: {sequence[0]['filename']}"
+
+    base_info = probe_media_info(ffmpeg_bin, first_clip_path)
+    target_w = base_info["width"] or 1280
+    target_h = base_info["height"] or 720
+    audio_info = probe_media_info(ffmpeg_bin, audio_path)
+    audio_dur = audio_info["duration"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        normalized_map: dict[str, Path] = {}
+        clip_durations: dict[str, float] = {}
+
+        # 1. Strip audio (-an) and normalize each unique clip once
+        unique_names = list(dict.fromkeys(item["filename"] for item in sequence))
+        for idx, fname in enumerate(unique_names):
+            src_path = VIDEO_CLIPS_DIR / fname
+            if not src_path.exists():
+                return False, f"Clip not found: {fname}"
+
+            info = probe_media_info(ffmpeg_bin, src_path)
+            clip_durations[fname] = max(info["duration"], 0.5)
+
+            norm_path = tmp / f"norm_{idx}.mp4"
+            vf = (
+                f"fps=30,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p"
+            )
+            cmd_norm = [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                str(src_path),
+                "-an",  # Delete all original AI video sound
+                "-vf",
+                vf,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                str(norm_path),
+            ]
+            res = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode != 0:
+                return False, f"Error stripping audio/normalizing '{fname}': {res.stderr[-400:]}"
+            normalized_map[fname] = norm_path
+
+        # 2. Build ordered concat playlist with loops
+        playlist_entries: list[Path] = []
+        total_video_dur = 0.0
+        for item in sequence:
+            fname = item["filename"]
+            loops = max(1, int(item.get("loops", 1)))
+            for _ in range(loops):
+                playlist_entries.append(normalized_map[fname])
+                total_video_dur += clip_durations[fname]
+
+        # If matching audio duration and video is shorter than audio, repeat last scene clip
+        if match_audio_length and audio_dur > 0 and total_video_dur < audio_dur:
+            last_fname = sequence[-1]["filename"]
+            last_dur = clip_durations[last_fname]
+            while total_video_dur < audio_dur:
+                playlist_entries.append(normalized_map[last_fname])
+                total_video_dur += last_dur
+
+        concat_txt = tmp / "concat_list.txt"
+        lines = [
+            f"file '{p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+            for p in playlist_entries
+        ]
+        concat_txt.write_text("\n".join(lines), encoding="utf-8")
+
+        # 3. Concatenate silent video and merge with music track
+        cmd_merge = [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_txt),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+        ]
+        if match_audio_length and audio_dur > 0:
+            cmd_merge.append("-shortest")
+        cmd_merge.append(str(out_path))
+
+        res_merge = subprocess.run(
+            cmd_merge, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if res_merge.returncode != 0:
+            return False, f"Error merging video and audio: {res_merge.stderr[-400:]}"
+
+    return True, "Music video built successfully!"
+
+
 # --- UI LAYOUT ---
 st.title("🎛️ Vocal Tone Digitizer")
-st.caption("Record voice → Digitize into exact synth stems → Mix with Suno beats & raw vocals.")
+st.caption("Record voice → Digitize into exact synth stems → Mix beats → Assemble silent AI videos with music.")
 
-tab_record, tab_synth, tab_mixer = st.tabs(
-    ["🎙️ Step 1: Record Tones", "🎹 Step 2: Save as Synth Stem", "🎚️ Step 3: Multi-Track Mixer"]
+tab_record, tab_synth, tab_mixer, tab_video = st.tabs(
+    [
+        "🎙️ Step 1: Record Tones",
+        "🎹 Step 2: Save as Synth Stem",
+        "🎚️ Step 3: Multi-Track Mixer",
+        "🎬 Step 4: Music Video Studio",
+    ]
 )
 
 # ==========================================
@@ -650,3 +834,304 @@ with tab_mixer:
                     b_file.unlink(missing_ok=True)
                     st.rerun()
                 st.audio(str(b_file), format="audio/wav")
+
+
+# ==========================================
+# TAB 4: AI VIDEO MUTE & MUSIC MERGER (FLOW-STYLE)
+# ==========================================
+with tab_video:
+    st.subheader("🎬 Step 4: AI Video Sequencer & Music Merger")
+    st.caption(
+        "Upload your AI video clips in order (like Google Flow) → Automatically delete all AI video sound → "
+        "Loop scenes & merge with your music track into a YouTube-ready MP4."
+    )
+
+    ffmpeg_bin = get_ffmpeg_bin()
+    if not ffmpeg_bin:
+        st.error(
+            "⚠️ **FFmpeg is not installed on this machine yet.** "
+            "Run `pip install imageio-ffmpeg` in your terminal and refresh this page to enable video processing."
+        )
+
+    if "video_sequence" not in st.session_state:
+        st.session_state["video_sequence"] = []
+    if "processed_video_uploads" not in st.session_state:
+        st.session_state["processed_video_uploads"] = set()
+
+    # --- 1. UPLOAD CLIPS IN ORDER ---
+    with st.container(border=True):
+        st.markdown("### 1. Upload AI Video Clips (Adds Next in Order & Strips Sound)")
+        uploaded_videos = st.file_uploader(
+            "Upload one or more AI video clips (.mp4, .mov, .webm, .mkv) — each new upload appends to the end of your sequence",
+            type=["mp4", "mov", "webm", "mkv"],
+            accept_multiple_files=True,
+            key="flow_video_uploader",
+        )
+
+        if uploaded_videos:
+            added_any = False
+            for up_vid in uploaded_videos:
+                sig = (up_vid.name, up_vid.size)
+                dest_clip = VIDEO_CLIPS_DIR / up_vid.name
+                if not dest_clip.exists() or dest_clip.stat().st_size != up_vid.size:
+                    dest_clip.write_bytes(up_vid.getvalue())
+
+                if sig not in st.session_state["processed_video_uploads"]:
+                    st.session_state["processed_video_uploads"].add(sig)
+                    st.session_state["video_sequence"].append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "filename": up_vid.name,
+                            "loops": 1,
+                        }
+                    )
+                    added_any = True
+
+            if added_any:
+                st.toast("Added uploaded clip(s) to sequence (sound will be stripped)!", icon="🎬")
+                st.rerun()
+
+        # Allow reusing already-uploaded clips (e.g., repeating Chorus clips)
+        available_clips = sorted(
+            [
+                p.name
+                for p in VIDEO_CLIPS_DIR.iterdir()
+                if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv")
+            ]
+        )
+        if available_clips:
+            reuse_c1, reuse_c2, reuse_c3 = st.columns([3, 1.5, 1.5])
+            clip_to_append = reuse_c1.selectbox(
+                "Add another saved clip to the end of the sequence (e.g. reuse Chorus clip):",
+                available_clips,
+                key="reuse_clip_select",
+            )
+            if reuse_c2.button("➕ Add Clip Next in Order", use_container_width=True):
+                st.session_state["video_sequence"].append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "filename": clip_to_append,
+                        "loops": 1,
+                    }
+                )
+                st.rerun()
+
+            if reuse_c3.button("🧹 Clear Sequence", use_container_width=True):
+                st.session_state["video_sequence"] = []
+                st.rerun()
+
+    # --- 2. FLOW-STYLE SEQUENCE TIMELINE ---
+    st.divider()
+    st.markdown("### 2. Scene Sequence Order (Original AI Audio Deleted Automatically)")
+
+    seq = st.session_state["video_sequence"]
+    total_seq_sec = 0.0
+
+    if not seq:
+        st.info(
+            "Your sequence is empty. Upload your first AI video clip above, then upload the next one to build your timeline!"
+        )
+    else:
+        for idx, item in enumerate(list(seq)):
+            clip_path = VIDEO_CLIPS_DIR / item["filename"]
+            clip_dur = 8.0
+            if ffmpeg_bin and clip_path.exists():
+                clip_dur = probe_media_info(ffmpeg_bin, clip_path)["duration"] or 8.0
+
+            seg_total = round(clip_dur * item["loops"], 1)
+            total_seq_sec += seg_total
+
+            with st.container(border=True):
+                c_info, c_loop, c_order = st.columns([3.2, 1.3, 2.5])
+
+                with c_info:
+                    st.markdown(
+                        f"**Scene {idx + 1}:** `{item['filename']}`  \n"
+                        f"🔇 *AI sound removed* • Clip: **{clip_dur:.1f}s** × **{item['loops']}x** = **{seg_total:.1f}s**"
+                    )
+                    with st.expander("Preview raw clip"):
+                        if clip_path.exists():
+                            st.video(str(clip_path))
+
+                with c_loop:
+                    new_loops = st.number_input(
+                        "Loop Count",
+                        min_value=1,
+                        max_value=30,
+                        value=int(item["loops"]),
+                        step=1,
+                        key=f"loop_{item['id']}",
+                        help="Repeat this clip back-to-back before moving to the next scene",
+                    )
+                    if new_loops != item["loops"]:
+                        st.session_state["video_sequence"][idx]["loops"] = int(new_loops)
+                        st.rerun()
+
+                with c_order:
+                    st.markdown("**Order**")
+                    b_up, b_dn, b_dup, b_del = st.columns(4)
+                    if b_up.button("⬆️", key=f"up_{item['id']}", disabled=(idx == 0), help="Move earlier"):
+                        seq[idx - 1], seq[idx] = seq[idx], seq[idx - 1]
+                        st.rerun()
+                    if b_dn.button(
+                        "⬇️", key=f"dn_{item['id']}", disabled=(idx == len(seq) - 1), help="Move later"
+                    ):
+                        seq[idx + 1], seq[idx] = seq[idx], seq[idx + 1]
+                        st.rerun()
+                    if b_dup.button("📋", key=f"dup_{item['id']}", help="Duplicate scene"):
+                        seq.insert(
+                            idx + 1,
+                            {
+                                "id": str(uuid.uuid4()),
+                                "filename": item["filename"],
+                                "loops": item["loops"],
+                            },
+                        )
+                        st.rerun()
+                    if b_del.button("🗑️", key=f"del_seq_{item['id']}", help="Remove from sequence"):
+                        seq.pop(idx)
+                        st.rerun()
+
+        st.info(
+            f"🎞️ **Total Silent Video Sequence Length:** **{total_seq_sec:.1f} seconds** "
+            f"({int(total_seq_sec // 60)}m {int(total_seq_sec % 60):02d}s) across **{len(seq)}** scene slot(s)."
+        )
+
+    # --- 3. MUSIC TRACK SELECTION & MERGE ---
+    st.divider()
+    st.markdown("### 3. Upload or Pick Music Track & Merge")
+
+    with st.container(border=True):
+        m_col1, m_col2 = st.columns([1.2, 1])
+
+        with m_col1:
+            uploaded_song = st.file_uploader(
+                "🎵 Upload Your Music Track (.wav, .mp3, .m4a, .ogg, .flac)",
+                type=["wav", "mp3", "m4a", "ogg", "flac"],
+                key="video_music_uploader",
+            )
+            if uploaded_song is not None:
+                song_dest = BEAT_DIR / uploaded_song.name
+                if not song_dest.exists() or song_dest.stat().st_size != uploaded_song.size:
+                    song_dest.write_bytes(uploaded_song.getvalue())
+                    st.toast(f"Loaded music track '{uploaded_song.name}'!", icon="🎵")
+
+        with m_col2:
+            all_songs = sorted(
+                [
+                    p
+                    for p in list(BEAT_DIR.iterdir()) + list(SUNO_DIR.iterdir()) + list(SAVE_DIR.iterdir())
+                    if p.suffix.lower() in (".wav", ".mp3", ".m4a", ".ogg", ".flac")
+                ],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            song_labels = [f"{p.parent.name}/{p.name}" for p in all_songs]
+            default_idx = 0
+            if uploaded_song is not None:
+                target_lbl = f"{BEAT_DIR.name}/{uploaded_song.name}"
+                if target_lbl in song_labels:
+                    default_idx = song_labels.index(target_lbl)
+
+            selected_song_label = st.selectbox(
+                "Or select any saved song/mix from your machine:",
+                ["(None)"] + song_labels,
+                index=(default_idx + 1) if song_labels else 0,
+                key="video_song_select",
+            )
+
+        chosen_audio_path: Path | None = None
+        if selected_song_label != "(None)":
+            chosen_audio_path = Path(selected_song_label)
+            if chosen_audio_path.exists():
+                st.audio(str(chosen_audio_path))
+                if ffmpeg_bin:
+                    song_dur = probe_media_info(ffmpeg_bin, chosen_audio_path)["duration"]
+                    st.caption(
+                        f"🎵 Selected Music Track Duration: **{song_dur:.1f}s** "
+                        f"({int(song_dur // 60)}m {int(song_dur % 60):02d}s)"
+                    )
+
+        opt_col1, opt_col2 = st.columns([1.5, 1.5])
+        match_audio = opt_col1.checkbox(
+            "Auto-fit video length to match music track (loops final scene if short, trims at song end)",
+            value=True,
+        )
+        video_out_name = opt_col2.text_input(
+            "Output Video Filename (optional):",
+            placeholder="e.g., to_be_me_music_video",
+        )
+
+        if st.button(
+            "🎬 Strip Video Sound & Merge With Music",
+            type="primary",
+            use_container_width=True,
+            disabled=(not ffmpeg_bin or not seq or chosen_audio_path is None),
+        ):
+            if video_out_name.strip():
+                clean_vname = "".join(
+                    c for c in video_out_name if c.isalnum() or c in ("-", "_")
+                ).strip()
+            else:
+                clean_vname = f"music_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            final_mp4_path = VIDEO_OUT_DIR / f"{clean_vname}.mp4"
+
+            with st.spinner(
+                "Deleting original AI video audio, stitching sequence in order, and merging your music track..."
+            ):
+                ok, msg = build_music_video(
+                    ffmpeg_bin=ffmpeg_bin,
+                    sequence=seq,
+                    audio_path=chosen_audio_path,
+                    out_path=final_mp4_path,
+                    match_audio_length=match_audio,
+                )
+
+            if ok:
+                st.session_state["latest_music_video"] = str(final_mp4_path)
+                st.toast("Music video ready!", icon="🔥")
+                st.rerun()
+            else:
+                st.error(msg)
+
+    # --- 4. PREVIEW & DOWNLOAD FINISHED VIDEOS ---
+    if "latest_music_video" in st.session_state:
+        latest_path = Path(st.session_state["latest_music_video"])
+        if latest_path.exists():
+            st.divider()
+            st.markdown("### 🎉 Latest Rendered Music Video")
+            st.video(str(latest_path))
+            st.download_button(
+                label=f"⬇️ Download {latest_path.name}",
+                data=latest_path.read_bytes(),
+                file_name=latest_path.name,
+                mime="video/mp4",
+                type="primary",
+                use_container_width=True,
+            )
+
+    st.divider()
+    st.subheader("🎥 Saved Music Videos")
+    saved_vids = sorted(
+        VIDEO_OUT_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not saved_vids:
+        st.caption("Your finished music videos will appear here.")
+    else:
+        for v_file in saved_vids:
+            with st.container(border=True):
+                v1, v2, v3 = st.columns([4, 1.5, 0.8])
+                v1.markdown(f"**{v_file.name}**")
+                v2.download_button(
+                    "⬇️ Download",
+                    data=v_file.read_bytes(),
+                    file_name=v_file.name,
+                    mime="video/mp4",
+                    key=f"dl_vid_{v_file.name}",
+                    use_container_width=True,
+                )
+                if v3.button("🗑️", key=f"del_vid_{v_file.name}"):
+                    v_file.unlink(missing_ok=True)
+                    st.rerun()
+                st.video(str(v_file))
